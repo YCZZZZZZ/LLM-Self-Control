@@ -3,8 +3,6 @@
 import torch
 import warnings
 import numpy as np
-from self_control.utils import get_sentence_embedding, get_verbalized_grads_from_wrapped_model, control_on_layers, label_smoothing, search_step_size
-from self_control.utils.suffix_manager import SuffixItem
 from scipy.special import softmax
 from typing import Union, List
 from peft import PeftModel
