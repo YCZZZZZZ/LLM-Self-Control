@@ -149,18 +149,19 @@ class WrappedReadingVecModel(torch.nn.Module):
 
             self.set_controller(layer_id, activations[layer_id], token_pos=token_pos, masks=1)
 
-    def contrast_generate(self, 
-                          prompt=None,
-                          coeffic=0.5,
-                          tokenizer=None,
-                          negative_prompt=None,
-                          positive_prompt=None,
-                          random_seed=0,
-                          layer_ids=None,
-                          use_cache=False,
-                          do_sample=False,
-                          **kwargs    
-                          ):
+    def contrast_generate(self, prompt=None,
+                                input_ids=None,
+                                attention_mask=None,
+                                coeffic=0.5,
+                                tokenizer=None,
+                                negative_prompt=None,
+                                positive_prompt=None,
+                                random_seed=0,
+                                layer_ids=None,
+                                use_cache=False,
+                                do_sample=False,
+                                **kwargs    
+                                ):
         transformers.set_seed(random_seed)
         random.seed(random_seed)
         np.random.seed(random_seed)
@@ -207,7 +208,6 @@ class WrappedReadingVecModel(torch.nn.Module):
         contrast_output = self.generate(**enc, use_cache=use_cache, do_sample=do_sample, **kwargs)
         return contrast_output
 
-
     def controlled_generate(self,
                             prompt: List[str]=None,
                             input_ids=None,
@@ -216,13 +216,14 @@ class WrappedReadingVecModel(torch.nn.Module):
                             loss_fct=None,
                             verbalizer=None,
                             coeff=-0.1,
-                            iterations=5,
-                            top_k=20,
+                            iterations=10,
+                            top_k=1,
                             max_search_steps=3,
                             token_pos="start",
                             layer_ids=list(range(0, 32, 1)),
                             random_seed=0,
                             consistent=True,
+                            n_branches=1,
                             use_last=False,
                             use_cache=False,
                             smoothing: float = 0,
@@ -238,10 +239,12 @@ class WrappedReadingVecModel(torch.nn.Module):
                             remain_control=False,
                             load_best_last=False,
                             last_max_new_tokens=None,
+                            initialization_prompt=None,
                             do_sample=False,
                             norm=1,
                             epsilon=0.3,
                             annealing: float=1,
+                            binary=False,
                             **kwargs    # for the generate function
                             ):
         """
@@ -255,6 +258,7 @@ class WrappedReadingVecModel(torch.nn.Module):
         self.model.eval()
         self.reset()
         best_loss = float('inf')
+        last_loss = float("inf") # used to record previous loss
         final_grads = {}
         grad_list = []
         temp_grads = {}
@@ -263,11 +267,13 @@ class WrappedReadingVecModel(torch.nn.Module):
         gradient_bs = 1 # TODO: default to 1
         orig_coeff = coeff
         final_output_dict = {}
+        norm_list = []
+        orig_prob = -1
 
         # Prepare inputs
         inputs = {}
         if prompt is not None:
-            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
+            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, add_special_tokens=False)
             inputs["input_ids"] = inputs["input_ids"].to(self.model.device)
             inputs["attention_mask"] = inputs["attention_mask"].to(self.model.device)
             query_length = inputs["input_ids"].size(1)
@@ -277,47 +283,63 @@ class WrappedReadingVecModel(torch.nn.Module):
             query_length = input_ids.size(1) if len(input_ids.shape) == 2 else input_ids.size(0) # size(0) might be the batch size
         if return_intermediate:
             iterative_outputs = []
+        # if n_branches > 1:
+        #     controlled_output = self.suffix_decoding(prompt, n_branches=n_branches, suffix=suffix, **kwargs)
+        #     # self.suffix_decoding(prompt, n_branches=n_branches, suffix=suffix, **kwargs)
+        # else:
         controlled_output = self.generate(**inputs, use_cache=use_cache, do_sample=do_sample, **kwargs) # the original output
         original_output = deepcopy(controlled_output)
         if verbose:
             print("Coeff: ", orig_coeff)
-        #     print("Original Output:\n", controlled_output)
-        #     rationale = self.generate([output+suffix.suffix for output in controlled_output], use_cache=use_cache, do_sample=do_sample, **kwargs)
-        #     print("Rationale:\n", rationale)
-        #     print("="*50)
+            print("Original Output:\n", controlled_output)
+            if isinstance(suffix, list):
+                verbose_suffix = suffix[0]
+            else:
+                verbose_suffix = suffix
+            rationale = self.generate([output+verbose_suffix.suffix for output in controlled_output], use_cache=use_cache, do_sample=do_sample, **kwargs)
+            print("Rationale:\n", rationale)
+            print("="*50)
+        previous_output = original_output
 
         for iter in range(iterations):
-            # print(controlled_output)
-            for i in range(len(controlled_output)):
-                controlled_output[i] = controlled_output[i] + suffix.suffix
 
             if isinstance(suffix, list):
                 warnings.warn(f"Accepting a list of suffixes has not been tested right now")
                 composed_grads = {}
+                multi_loss = 0
                 for suffix_item in suffix:
+                    suffix_string = suffix_item.suffix
                     target = suffix_item.target
                     target_token = self.tokenizer.encode(target, add_special_tokens=False, return_tensors='pt').squeeze(0)
                     assert target_token.shape[-1] == 1, "Target should be a single token for now."
                     target_token = (target_token * torch.ones(gradient_bs).long()).to(self.model.device)
                     verbalizer = [target_token[0]]
-                    grads, outputs, loss, probs, logits, norms = get_verbalized_grads_from_wrapped_model(
+                    grads, outputs, loss, probs, logits, norms, orig_norm = get_verbalized_grads_from_wrapped_model(
                         wrapped_model=self,
                         tokenizer=self.tokenizer,
-                        inputs=controlled_output,
+                        inputs=[output + suffix_string for output in controlled_output],
                         loss_fct=loss_fct,
                         targets=target_token,
                         verbalizer=verbalizer,
                         smoothing=smoothing,
                         top_k=top_k,
+                        query_length=query_length,
                         norm=norm,
                         step_size=orig_coeff,
                         gradient_manipulation=gradient_manipulation,
+                        binary=binary,
                     )
-                    composed_grads = {k: (composed_grads[k] + grads[k] * suffix_item.direction) if k in composed_grads else grads[k]\
+                    multi_loss += loss.item()
+                    # FIXME: fix the hard-coded normalization
+                    composed_grads = {k: (composed_grads[k][:, :query_length] + grads[k][:, :query_length] * suffix_item.direction * 0.5) if k in composed_grads else grads[k][:, :query_length] * 0.5\
                                        for k in set(grads)}
                 grads = composed_grads
                 del composed_grads
+                loss = multi_loss
             else:
+                for i in range(len(controlled_output)):
+                    controlled_output[i] = controlled_output[i] + suffix.suffix
+
                 target = suffix.target
                 target_token = self.tokenizer.encode(target, add_special_tokens=False, return_tensors='pt').squeeze(0)
                 if target_token.shape[-1] != 1:
@@ -333,30 +355,50 @@ class WrappedReadingVecModel(torch.nn.Module):
                     verbalizer=verbalizer,
                     smoothing=smoothing,
                     top_k=top_k,
+                    query_length=query_length,
                     norm=norm,
                     step_size=orig_coeff,
                     gradient_manipulation=gradient_manipulation,
+                    binary=binary,
                 )
+            if iter == 0:
+                orig_prob = probs
+
+            test_grads = {}
+            for i in grads:
+                test_grads[i] = grads[i].clone()
+            # save norms
+            norm_list.append(norms)
 
             if loss < best_loss:
                 best_loss = loss
                 best_grads = acc_grads
+
+            # if loss cannot decrease anymore, break the iteration
+
+            if abs(loss.item() - last_loss) < 0.01:
+                break
+
+            # TODO: add search for multi-principle control
             if search:
-                step_size = search_step_size(
-                    orig_input              =   prompt,
-                    suffix                  =   suffix.suffix,
+                if n_branches > 1:
+                    warnings.warn("Branching may not be compatible with searching")
+                step_size, best_loss = search_step_size(
+                    orig_input              =   inputs,
+                    suffix                  =   suffix,
+                    random_seed             =   random_seed,
                     wrapped_model           =   self,
                     acc_grads               =   acc_grads,
                     initial_step_size       =   orig_coeff,
+                    layer_ids               =   layer_ids,
                     verbose                 =   verbose,
                     max_iterations          =   max_search_steps,
-                    smoothing               =   smoothing,
-                    top_k                   =   top_k,
                     initial_grads_loss      =   {
                         "grads": grads,
                         "loss": loss,
                         "controlled_output":    controlled_output
                     },
+                    smoothing               =   smoothing,
                     gradient_manipulation   =   gradient_manipulation,
                     # control args
                     tokenizer               =   self.tokenizer,
@@ -366,9 +408,10 @@ class WrappedReadingVecModel(torch.nn.Module):
                     loss_fct                =   loss_fct,
                     **kwargs
                 )
+                self.reset()
                 coeff = step_size
                 if gradient_manipulation == "pgd":  # TODO: optimize this
-                    grads, outputs, loss, probs, logits, norms = get_verbalized_grads_from_wrapped_model(
+                    grads, outputs, loss, probs, logits, norms, orig_norm = get_verbalized_grads_from_wrapped_model(
                         wrapped_model=self,
                         tokenizer=self.tokenizer,
                         inputs=controlled_output,
@@ -377,12 +420,17 @@ class WrappedReadingVecModel(torch.nn.Module):
                         verbalizer=verbalizer,
                         smoothing=smoothing,
                         top_k=top_k,
+                        query_length=query_length,
                         norm=norm,
                         step_size=coeff,
                         gradient_manipulation=gradient_manipulation,
+                        binary=binary,
                     )
+                #loss = best_loss
             if gradient_manipulation == "pgd":  # If pgd then it's already controlled with the step size
                 coeff = 1
+            for i in test_grads:
+                assert torch.equal(test_grads[i], grads[i])
             for i in grads:
                 if i in acc_grads:
                     acc_grads[i] = acc_grads[i][:, :query_length] + coeff * grads[i][:, :query_length]
@@ -392,9 +440,12 @@ class WrappedReadingVecModel(torch.nn.Module):
             if return_all_grads:
                 temp_grads = {}
                 for i in acc_grads:
-                    temp_grads[i] = acc_grads[i].detach().cpu().clone()
+                    temp_grads[i] = grads[i].detach().cpu().clone()
                 grad_list.append(temp_grads)
                 del temp_grads
+            # if n_branches > 1:
+            #     controlled_output = self.suffix_decoding(single_prompt, n_branches=n_branches, suffix=suffix, **kwargs)
+            # else:
             self.control_on_layers(
                 layer_ids=layer_ids,
                 grads=acc_grads,
@@ -402,32 +453,78 @@ class WrappedReadingVecModel(torch.nn.Module):
                 token_pos=token_pos,
                 gradient_manipulation=gradient_manipulation,
                 epsilon=epsilon
-            )
-
-            controlled_output = self.generate(**inputs, use_cache=use_cache, do_sample=do_sample, **kwargs)
+                )
+            if n_branches > 1:
+                if prompt is not None:
+                    controlled_output = self.suffix_decoding(prompt, n_branches=n_branches, suffix=suffix, **kwargs)
+                else:
+                    controlled_output = self.suffix_decoding(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], 
+                                                             n_branches=n_branches, suffix=suffix, **kwargs)
+            else:
+                controlled_output = self.generate(**inputs, use_cache=use_cache, do_sample=do_sample, **kwargs)
             if not consistent:
                 self.reset()
-            # if verbose:
-            #     print(f"Loss from the iteration {iter}: {loss.item()}")
-            #     print(f"Output form the iteration {iter}:\n", controlled_output)
-            #     rationale = self.generate([output + suffix.suffix for output in controlled_output], keep_input=False, use_cache=use_cache, do_sample=do_sample, **kwargs)
-            #     print("Rationale:\n", rationale)
-            #     print("="*50)
+            if verbose:
+                print(f"Loss from the iteration {iter}: {loss}")
+                print(f"Best step-size from the iteration {iter}: {coeff}")
+                print(f"Output form the iteration {iter}:\n", controlled_output)
+                if isinstance(suffix, list):
+                    verbose_suffix = suffix[0]
+                else:
+                    verbose_suffix = suffix
+                rationale = self.generate([output + verbose_suffix.suffix for output in controlled_output], do_sample=do_sample, **kwargs)
+                print("Rationale:\n", rationale)
+                print("="*50)
             if return_intermediate:
                 iterative_outputs.append(deepcopy(controlled_output))
-        controlled_output = [output + suffix.suffix for output in controlled_output]
-        grads, outputs, loss, probs, logits, norms = get_verbalized_grads_from_wrapped_model(
-            wrapped_model=self,
-            tokenizer=self.tokenizer,
-            inputs=controlled_output,
-            loss_fct=loss_fct,
-            targets=target_token,
-            verbalizer=verbalizer,
-            smoothing=smoothing,
-            top_k=top_k,
-            norm=norm,
-            gradient_manipulation=gradient_manipulation,
-        )
+            
+            if controlled_output == previous_output:
+                break
+            last_loss = loss.item()
+            previous_output = deepcopy(controlled_output)
+        if isinstance(suffix, list):
+            multi_loss = 0
+            for suffix_item in suffix:
+                suffix_string = suffix_item.suffix
+                target = suffix_item.target
+                target_token = self.tokenizer.encode(target, add_special_tokens=False, return_tensors='pt').squeeze(0)
+                assert target_token.shape[-1] == 1, "Target should be a single token for now."
+                target_token = (target_token * torch.ones(gradient_bs).long()).to(self.model.device)
+                verbalizer = [target_token[0]]
+                grads, outputs, loss, probs, logits, norms, orig_norm = get_verbalized_grads_from_wrapped_model(
+                    wrapped_model=self,
+                    tokenizer=self.tokenizer,
+                    inputs=[output + suffix_string for output in controlled_output],
+                    loss_fct=loss_fct,
+                    targets=target_token,
+                    verbalizer=verbalizer,
+                    smoothing=smoothing,
+                    top_k=top_k,
+                    query_length=query_length,
+                    norm=norm,
+                    step_size=orig_coeff,
+                    gradient_manipulation=gradient_manipulation,
+                    binary=binary,
+                )
+                multi_loss += loss.item()
+            loss = multi_loss
+        else:
+            controlled_output = [output + suffix.suffix for output in controlled_output]
+            grads, outputs, loss, probs, logits, norms, orig_norm = get_verbalized_grads_from_wrapped_model(
+                wrapped_model=self,
+                tokenizer=self.tokenizer,
+                inputs=controlled_output,
+                loss_fct=loss_fct,
+                targets=target_token,
+                verbalizer=verbalizer,
+                smoothing=smoothing,
+                top_k=top_k,
+                query_length=query_length,
+                norm=norm,
+                step_size=coeff,
+                gradient_manipulation=gradient_manipulation,
+                binary=binary,
+            )
         if loss < best_loss:
             best_loss = loss
             best_grads = acc_grads
@@ -443,9 +540,27 @@ class WrappedReadingVecModel(torch.nn.Module):
             )
         if last_max_new_tokens is not None:
             kwargs.pop("max_new_tokens")
-            controlled_output = self.generate(**inputs, use_cache=use_cache, do_sample=do_sample, return_ids=return_ids, max_new_tokens=last_max_new_tokens, **kwargs) # only pass return_ids here
+            if n_branches > 1:
+                if prompt is not None:
+                    controlled_output = self.suffix_decoding(prompt, n_branches=n_branches, suffix=suffix, max_new_tokens=last_max_new_tokens, **kwargs)
+                else:
+                    controlled_output = self.suffix_decoding(input_ids=inputs["input_ids"], 
+                                                              attention_mask=inputs["attention_mask"],
+                                                              n_branches=n_branches,
+                                                              suffix=suffix, 
+                                                              max_new_tokens=last_max_new_tokens,
+                                                              **kwargs)
+            else:
+                controlled_output = self.generate(**inputs, use_cache=use_cache, do_sample=do_sample, return_ids=return_ids, max_new_tokens=last_max_new_tokens, **kwargs) # only pass return_ids here
         else:
-            controlled_output = self.generate(**inputs, use_cache=use_cache, do_sample=do_sample, return_ids=return_ids, **kwargs) # only pass return_ids here
+            if n_branches > 1:
+                if prompt is not None:
+                    controlled_output = self.suffix_decoding(prompt, n_branches=n_branches, suffix=suffix, **kwargs)
+                else:
+                    controlled_output = self.suffix_decoding(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+                                                             n_branches=n_branches, suffix=suffix, **kwargs)
+            else:
+                controlled_output = self.generate(**inputs, use_cache=use_cache, do_sample=do_sample, return_ids=return_ids, **kwargs) # only pass return_ids here
         # TODO: return a dict
         final_output_dict["final_response"] = controlled_output
         if return_logits:
@@ -462,9 +577,83 @@ class WrappedReadingVecModel(torch.nn.Module):
             final_output_dict["intermediate_outputs"] = [original_output] + iterative_outputs
         if return_all_grads:
             final_output_dict["all_grads"] = grad_list
-
+        final_output_dict["norms"] = norm_list
+        final_output_dict["prob"] = probs
+        final_output_dict["orig_prob"] = orig_prob
         return final_output_dict
 
+    def get_suffix_score(self, prompt, suffix, **kwargs):
+        targets = self.tokenizer.encode(suffix.target, add_special_tokens=False)
+        tokenized = self.tokenizer(prompt, return_tensors="pt", padding=True)
+        tokenized["input_ids"] = tokenized["input_ids"].to(self.model.device)
+        tokenized["attention_mask"] = tokenized["attention_mask"].to(self.model.device)
+        with torch.enable_grad():
+            outputs = self.model(
+                input_ids=tokenized["input_ids"],
+                attention_mask=tokenized["attention_mask"],
+                output_hidden_states=True,
+            )
+
+        yes_token = self.tokenizer.encode("Yes", add_special_tokens=False)[0]
+        no_token = self.tokenizer.encode("No", add_special_tokens=False)[0]
+        assert targets[0] in [yes_token, no_token]
+        ret_prob_list = []
+        probs = softmax(outputs.logits[:, -1, [yes_token, no_token]].detach().cpu().numpy())
+        for prob in probs:
+            target_idx = torch.where(torch.tensor([yes_token, no_token]) == targets[0])[0]
+            neg_target_idx = torch.where(torch.tensor([yes_token, no_token]) != targets[0])[0]
+            ret_prob_list.append(prob[target_idx])
+        return ret_prob_list
+
+    def suffix_decoding(self,
+                        input_ids: None,
+                        attention_mask: None,
+                        prompt: List[str]=None,
+                        suffix: Union[SuffixItem, List[SuffixItem]]=None,
+                        return_all=False,
+                        n_branches=3,
+                        **kwargs):
+        if prompt is not None:
+            bsz = len(prompt)
+        else:
+            bsz = input_ids.shape[0]
+        max_new_tokens = kwargs["max_new_tokens"]
+
+        if prompt is not None:
+            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
+            inputs["input_ids"] = inputs["input_ids"].to(self.model.device)
+            inputs["attention_mask"] = inputs["attention_mask"].to(self.model.device)
+            input_ids = self.generate(**inputs, return_ids=True, do_sample=False, num_beams=n_branches, num_return_sequences=n_branches, max_new_tokens=1, min_new_tokens=1)
+            attention_mask = inputs["attention_mask"].repeat_interleave(n_branches, 0)
+            attention_mask = torch.cat([
+                attention_mask, torch.ones((len(attention_mask), 1), device=attention_mask.device, dtype=attention_mask.dtype),
+            ], dim=1)
+            del inputs
+        else:
+            inputs = {}
+            inputs["input_ids"] = input_ids.to(self.model.device)
+            inputs["attention_mask"] = attention_mask.to(self.model.device)
+            input_ids = self.generate(**inputs, return_ids=True, do_sample=False, num_beams=n_branches, num_return_sequences=n_branches, max_new_tokens=1, min_new_tokens=1)
+            attention_mask = inputs["attention_mask"].repeat_interleave(n_branches, 0)
+            attention_mask = torch.cat([
+                attention_mask, torch.ones((len(attention_mask), 1), device=attention_mask.device, dtype=attention_mask.dtype),
+            ], dim=1)
+            del inputs
+
+        gen_ids = self.generate(
+            input_ids=input_ids, return_ids=True, attention_mask=attention_mask, do_sample=False, max_new_tokens=max_new_tokens - 1,
+        )
+        gen_ids = gen_ids.reshape(bsz, n_branches, -1)
+        ret_list = []
+        for i in range(bsz):
+            outputs = self.tokenizer.batch_decode(gen_ids[i], skip_special_tokens=True)
+            score_list = self.get_suffix_score(outputs, suffix)
+            if not return_all:
+                ret_list.append(outputs[np.argmax(score_list)])
+            else:
+                ret_list.append(outputs)
+        
+        return ret_list
         
     def generate(self,
                  prompt: List[str]=None,
